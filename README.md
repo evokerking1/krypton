@@ -1,4 +1,4 @@
-![Krypton](https://i.imgur.com/tKSGeVn.png)
+![Krypton](https://i.imgur.com/sq7HIbA.png)
 
 # Krypton Daemon
 
