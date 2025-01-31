@@ -9,11 +9,13 @@ import * as path from 'path';
 import si from 'systeminformation';
 import yaml from 'js-yaml';
 import cors from 'cors';
+import expressWs from 'express-ws'
 
 // Routers
 import { configureServersRouter, runInstallation } from './routers/servers';
 import { configureStateRouter } from './routers/state';
 import { configureWebSocketRouter } from './routers/websocket';
+import { configureFilesystemRouter } from './routers/filesystem';
 
 export const VERSION = '1.0.0';
 
@@ -100,7 +102,6 @@ export interface AppState {
   config: Config;
   systemInfo: typeof si;
   wsServer: WebSocketServer;
-  runInstallation: (serverId: string, config: any) => Promise<void>;
 }
 
 // Default configuration
@@ -182,6 +183,7 @@ async function main() {
 
     // Initialize Express app
     const app = express();
+    expressWs(app);
     app.use(express.json());
 
     // Create HTTP server
@@ -196,9 +198,7 @@ async function main() {
       db,
       config,
       systemInfo: si,
-      wsServer,
-      runInstallation: async (serverId: string, config: any) => 
-        runInstallation(appState, serverId, config)
+      wsServer
     };
 
     app.use(cors({
@@ -218,6 +218,7 @@ async function main() {
     // Configure routes
     app.use('/api/v1/servers', apiKeyMiddleware(config), configureServersRouter(appState));
     app.use('/api/v1/state', configureStateRouter(appState));
+    app.use('/api/v1/filesystem', configureFilesystemRouter(appState))
 
     // Configure WebSocket router
     configureWebSocketRouter(appState);

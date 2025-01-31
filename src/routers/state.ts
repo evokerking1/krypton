@@ -2,11 +2,21 @@
 import { Router } from 'express';
 import { AppState, SystemState, ContainerStats, VERSION } from '../index';
 
+let cachedSystemState: SystemState | null = null;
+let cacheTimestamp: number | null = null;
+const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes in milliseconds
+
 export function configureStateRouter(appState: AppState): Router {
   const router = Router();
 
   router.get('/', async (req, res) => {
     try {
+      const now = Date.now();
+
+      if (cachedSystemState && cacheTimestamp && (now - cacheTimestamp < CACHE_DURATION)) {
+        return res.json(cachedSystemState);
+      }
+
       const { docker, systemInfo } = appState;
 
       // Get container statistics
@@ -34,6 +44,9 @@ export function configureStateRouter(appState: AppState): Router {
         memoryTotal: memInfo.total || 0,
         containers: containerStats,
       };
+
+      cachedSystemState = systemState;
+      cacheTimestamp = now;
 
       res.json(systemState);
     } catch (error) {

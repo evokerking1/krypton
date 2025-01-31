@@ -1,5 +1,5 @@
 import express, { Router } from 'express';
-import { WebSocket } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
 import { Writable } from 'stream';
@@ -8,6 +8,7 @@ import * as path from 'path';
 import { AppState, ServerState } from '../index';
 import { Exec, ExecCreateOptions } from 'dockerode';
 import { Duplex } from 'stream';
+import chalk from 'chalk';
 
 // Types that represent what we expect from the panel
 interface ServerConfig {
@@ -167,154 +168,270 @@ function logEvent(serverId: string, message: string, error?: any) {
   }
 }
 
-// Main server installation process
-export async function runInstallation(
-  appState: AppState, 
-  serverId: string,
-  serverConfig: ServerConfig
-): Promise<void> {
-  const { docker, config, wsServer } = appState;
-  const safeServerId = sanitizeVolumeName(serverId);
-  const volumePath = path.resolve(`${config.volumesDirectory}/${safeServerId}`);
+class InstallLogger {
+  private serverId: string;
+  private wsServer: WebSocketServer; // Use WebSocketServer type
+  private logBuffer: string[] = [];
 
-  logEvent(serverId, 'Starting installation process');
+  constructor(serverId: string, wsServer: WebSocketServer) {
+    this.serverId = serverId;
+    this.wsServer = wsServer;
+  }
+
+  log(message: string, error?: any) {
+    const timestamp = new Date().toISOString();
+    const formattedMessage = `[${timestamp}] ${message}`;
+    this.logBuffer.push(formattedMessage);
+
+    console.log(`[Server ${this.serverId}] ${message}`);
+    if (error) {
+      console.error(`[Server ${this.serverId}] Error:`, error);
+    }
+
+    // Broadcast to WebSocket clients
+    this.broadcast(message, error);
+  }
+
+  getLogBuffer(): string[] {
+    return this.logBuffer;
+  }
+
+  private broadcast(message: string, error?: any) {
+    this.wsServer.clients.forEach((client: WebSocket) => { // Use WebSocket type for client
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({
+            event: 'console_output',
+            data: {
+              message: error ? chalk.red(message) : message,
+              timestamp: new Date().toISOString(),
+              type: error ? 'error' : 'info',
+            },
+          })
+        );
+      }
+    });
+  }
+}
+
+// Improved installation process with better error handling and logging
+export async function runInstallation(
+  appState: AppState,
+  serverId: string,
+  serverConfig: ServerConfig,
+  memoryLimit: number
+): Promise<void> {
+  const logger = new InstallLogger(serverId, appState.wsServer);
+  const { docker, config } = appState;
+  const safeServerId = serverId.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  const volumePath = path.resolve(`${config.volumesDirectory}/${safeServerId}`);
+  
+  // Create installation workspace
+  const installationPath = path.join(volumePath, '.installation');
+  await fs.mkdir(installationPath, { recursive: true });
   
   try {
-    logEvent(serverId, 'Pulling required Docker images');
-    await Promise.all([
-      pullDockerImage(docker, serverConfig.install.dockerImage)
-        .then(() => logEvent(serverId, `Successfully pulled install image: ${serverConfig.install.dockerImage}`)),
-      pullDockerImage(docker, serverConfig.dockerImage)
-        .then(() => logEvent(serverId, `Successfully pulled server image: ${serverConfig.dockerImage}`))
-    ]);
+    // Prepare installation environment
+    logger.log('Creating installation environment...');
+    await prepareInstallationEnvironment(installationPath, serverConfig, logger);
 
-    logEvent(serverId, `Creating volume directory at: ${volumePath}`);
-    await fs.mkdir(volumePath, { recursive: true });
+    // Pull required images
+    logger.log('Pulling required Docker images...');
+    await pullRequiredImages(docker, serverConfig, logger);
 
-    if (serverConfig.configFiles.length > 0) {
-      logEvent(serverId, `Writing ${serverConfig.configFiles.length} configuration files`);
-      await writeConfigFiles(volumePath, serverConfig.configFiles);
-    }
+    // Write installation script with proper error handling
+    logger.log('Preparing installation script...');
+    const scriptPath = await writeInstallationScript(installationPath, serverConfig, logger);
 
-    const installContainerName = `${safeServerId}_install`;
-    logEvent(serverId, `Creating installation container: ${installContainerName}`);
-
-    const processedScript = processVariables(serverConfig.install.script, serverConfig.variables);
-    
-    const scriptContent = `
-${processedScript}
-echo "Installation script completed" >> /mnt/server/install.log 2>&1
-`;
-
-    await fs.writeFile(path.join(volumePath, 'install.sh'), scriptContent, { mode: 0o755 });
-
-    const environmentVariables = [
-      'TERM=xterm',
-      'HOME=/mnt/server',  // Note: Different path for install container
-      'USER=container',
-      ...serverConfig.variables.map(variable => 
-        `${variable.name}=${variable.currentValue || variable.defaultValue}`
-      )
-    ];
-
-const container = await docker.createContainer({
-  name: installContainerName,
-  Image: serverConfig.install.dockerImage,
-  HostConfig: {
-    Binds: [`${volumePath}:/mnt/server`],
-    AutoRemove: true
-  },
-  WorkingDir: '/mnt/server',
-  Cmd: ["./install.sh"],
-  AttachStdin: true,
-  AttachStdout: true,
-  AttachStderr: true,
-  Tty: true,
-  OpenStdin: true,
-  Env: environmentVariables  // env
-});
-
-    logEvent(serverId, `Created container with config: ${JSON.stringify({
-      name: installContainerName,
-      image: serverConfig.install.dockerImage,
+    // Create and run installation container
+    logger.log('Starting installation container...');
+    const containerId = await runInstallationContainer(
+      docker,
+      safeServerId,
+      serverConfig,
       volumePath,
-      cmd: "./install.sh"
-    }, null, 2)}`);
+      scriptPath,
+      memoryLimit,
+      logger
+    );
 
-    // Log the install script content
-    logEvent(serverId, `Install script content:\n${scriptContent}`);
+    // Monitor installation progress
+    await monitorInstallation(docker, containerId, logger);
 
-    logEvent(serverId, 'Starting installation container');
-
-    const stream = await container.attach({
-      stream: true,
-      stdout: true,
-      stderr: true
-    });
-
-    let output = '';
-    let lastChunk = '';
-
-    const stdout = new Writable({
-      write(chunk: Buffer, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
-        const message = chunk.toString();
-        lastChunk = message;
-        if (message.trim()) {
-          output += message;
-          logEvent(serverId, `Installation stdout: ${message.trim()}`);
-          
-          wsServer.clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({
-                event: 'console_output',
-                serverId,
-                data: message
-              }));
-            }
-          });
-        }
-        callback();
-      }
-    });
-
-    const stderr = new Writable({
-      write(chunk: Buffer, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
-        const message = chunk.toString();
-        lastChunk = message;
-        if (message.trim()) {
-          output += message;
-          logEvent(serverId, `Installation stderr: ${message.trim()}`);
-        }
-        callback();
-      }
-    });
-
-    docker.modem.demuxStream(stream, stdout, stderr);
-
-    await container.start();
-    logEvent(serverId, 'Container started, waiting for completion...');
-
-    const result = await container.wait();
-    logEvent(serverId, `Container exited with status code: ${result.StatusCode}`);
-    logEvent(serverId, `Last output received: ${lastChunk}`);
-    logEvent(serverId, `Full installation output:\n${output}`);
-
-    if (result.StatusCode !== 0) {
-      throw new Error(`Installation failed with exit code ${result.StatusCode}.\nLast output: ${lastChunk}\nFull output:\n${output}`);
-    }
-
-    logEvent(serverId, 'Installation completed successfully');
-
+    logger.log('Installation completed successfully');
+    
+    // Cleanup installation files
+    await fs.rm(installationPath, { recursive: true, force: true });
+    
   } catch (error) {
-    logEvent(serverId, 'Installation failed', error);
+    logger.log('Installation failed', error);
+    // Save installation logs
+    const logPath = path.join(volumePath, 'installation.log');
+    await fs.writeFile(logPath, logger.getLogBuffer().join('\n'));
     throw error;
-  } finally {
+  }
+}
+
+async function prepareInstallationEnvironment(
+  installPath: string,
+  config: ServerConfig,
+  logger: InstallLogger
+): Promise<void> {
+  // Create necessary directories
+  await fs.mkdir(path.join(installPath, 'logs'), { recursive: true });
+  await fs.mkdir(path.join(installPath, 'temp'), { recursive: true });
+  
+  // Write configuration files
+  for (const file of config.configFiles) {
+    const safePath = path.normalize(file.path).replace(/^(\.\.[\/\\])+/, '');
+    const fullPath = path.join(installPath, 'config', safePath);
+    
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, file.content, 'utf8');
+    logger.log(`Created config file: ${safePath}`);
+  }
+}
+
+async function pullRequiredImages(
+  docker: any,
+  config: ServerConfig,
+  logger: InstallLogger
+): Promise<void> {
+  const images = [config.install.dockerImage, config.dockerImage];
+  
+  for (const image of images) {
+    logger.log(`Pulling image: ${image}`);
     try {
-      const container = docker.getContainer(`${safeServerId}_install`);
-      logEvent(serverId, 'Cleaning up installation container');
-      //await container.remove({ force: true }).catch(() => {});
-    } catch (cleanupError) {
-      logEvent(serverId, 'Failed to remove installation container', cleanupError);
+      await new Promise((resolve, reject) => {
+        docker.pull(image, (err: any, stream: any) => {
+          if (err) return reject(err);
+          
+          docker.modem.followProgress(stream, 
+            (err: any, output: any) => err ? reject(err) : resolve(output),
+            (event: any) => {
+              if (event.status && event.progress) {
+                logger.log(`${image}: ${event.status} ${event.progress}`);
+              }
+            }
+          );
+        });
+      });
+      logger.log(`Successfully pulled ${image}`);
+    } catch (error) {
+      throw new Error(`Failed to pull ${image}: ${error.message}`);
+    }
+  }
+}
+
+async function writeInstallationScript(
+  installPath: string,
+  config: ServerConfig,
+  logger: InstallLogger
+): Promise<string> {
+  const scriptContent = `#!/bin/bash
+set -e
+exec 1> >(tee -a "/mnt/server/.installation/logs/install.log")
+exec 2>&1
+
+echo "=== Installation Started at $(date) ==="
+echo "Setting up environment..."
+
+# Setup error handling
+trap 'echo "Error on line $LINENO" >> /mnt/server/.installation/logs/install.log' ERR
+
+# Process variables
+${config.variables.map(v => `export ${v.name}="${v.currentValue || v.defaultValue}"`).join('\n')}
+
+# Main installation script
+echo "Running main installation script..."
+${config.install.script}
+
+EXIT_CODE=$?
+
+echo "=== Installation Finished at $(date) with exit code $EXIT_CODE ==="
+exit $EXIT_CODE`;
+
+  const scriptPath = path.join(installPath, 'install.sh');
+  await fs.writeFile(scriptPath, scriptContent, { mode: 0o755 });
+  await fs.chmod(scriptPath, 0o755);  // Ensure script is executable
+  
+  return scriptPath;
+}
+
+async function runInstallationContainer(
+  docker: any,
+  safeServerId: string,
+  config: ServerConfig,
+  volumePath: string,
+  scriptPath: string,
+  memoryLimit: number,
+  logger: InstallLogger
+): Promise<string> {
+  const container = await docker.createContainer({
+    name: `${safeServerId}_install`,
+    Image: config.install.dockerImage,
+    HostConfig: {
+      Binds: [`${volumePath}:/mnt/server:rw`],
+      Memory: memoryLimit,
+      MemorySwap: memoryLimit * 2,
+      AutoRemove: true,
+      NetworkMode: 'bridge'
+    },
+    WorkingDir: '/mnt/server',
+    Cmd: ['bash', '.installation/install.sh'],
+    Env: [
+      'DEBIAN_FRONTEND=noninteractive',
+      ...config.variables.map(v => `${v.name}=${v.currentValue || v.defaultValue}`)
+    ],
+    AttachStdin: true,
+    AttachStdout: true,
+    AttachStderr: true,
+    Tty: true,
+    OpenStdin: true
+  });
+
+  const stream = await container.attach({
+    stream: true,
+    stdout: true,
+    stderr: true
+  });
+
+  // Setup output handling
+  const handleOutput = (chunk: Buffer) => {
+    const message = chunk.toString().trim();
+    if (message) {
+      logger.log(message);
+    }
+  };
+
+  stream.on('data', handleOutput);
+  stream.on('error', (error: Error) => logger.log('Stream error:', error));
+
+  await container.start();
+  return container.id;
+}
+
+async function monitorInstallation(
+  docker: any,
+  containerId: string,
+  logger: InstallLogger
+): Promise<void> {
+  const container = docker.getContainer(containerId);
+  
+  // Wait for container to finish
+  const result = await container.wait();
+  
+  if (result.StatusCode !== 0) {
+    // Read logs from the installation log file
+    try {
+      const logs = await container.logs({
+        stdout: true,
+        stderr: true,
+        tail: 50
+      });
+      throw new Error(`Installation failed with exit code ${result.StatusCode}\nLast 50 lines of logs:\n${logs}`);
+    } catch (error) {
+      throw new Error(`Installation failed with exit code ${result.StatusCode}`);
     }
   }
 }
@@ -334,7 +451,6 @@ async function createGameContainer(
   
   const processedStartupCommand = processVariables(config.startupCommand, config.variables);
   
-  // Map environment variables from the config
   const environmentVariables = [
     'TERM=xterm',
     'HOME=/home/container',
@@ -349,11 +465,9 @@ async function createGameContainer(
     name: safeServerId,
     Image: config.dockerImage,
     
-    // Don't override the entrypoint/cmd - let the image handle it
     Entrypoint: undefined,
     Cmd: undefined,
     
-    // Standard configuration
     WorkingDir: '/home/container',
     AttachStdin: true,
     AttachStdout: true,
@@ -363,22 +477,17 @@ async function createGameContainer(
     StdinOnce: false,
     User: 'container',
     
-    // Environment setup
     Env: environmentVariables,
     
     HostConfig: {
-      // Memory limits
       Memory: memoryLimit,
-      MemorySwap: memoryLimit * 2, // Double the memory limit for swap
+      MemorySwap: memoryLimit * 2,
       
-      // CPU limits if provided
       CpuQuota: cpuLimit ? cpuLimit * 100000 : 0,
       CpuPeriod: 100000,
       
-      // Network configuration
       NetworkMode: 'bridge',
       
-      // Security options
       Init: true,
       SecurityOpt: ['no-new-privileges'],
       ReadonlyPaths: [
@@ -389,15 +498,12 @@ async function createGameContainer(
         '/proc/sysrq-trigger'
       ],
       
-      // Container restart policy
       RestartPolicy: {
         Name: 'unless-stopped'
       },
       
-      // Volume mounting
       Binds: [`${volumePath}:/home/container:rw`],
       
-      // Port bindings - handle both TCP and UDP
       PortBindings: {
         [`${allocation.port}/tcp`]: [{
           HostIp: allocation.bindAddress,
@@ -410,13 +516,11 @@ async function createGameContainer(
       },
     },
     
-    // Expose both TCP and UDP ports
     ExposedPorts: {
       [`${allocation.port}/tcp`]: {},
       [`${allocation.port}/udp`]: {}
     },
 
-    // Labels for container identification
     Labels: {
       'pterodactyl.server.id': serverId,
       'pterodactyl.server.name': safeServerId
@@ -474,7 +578,7 @@ export function configureServersRouter(appState: AppState): Router {
       });
 
       // Begin installation process
-      runInstallation(appState, serverId, serverConfig)
+      runInstallation(appState, serverId, serverConfig, memoryLimit)
         .then(async () => {
           const dockerId = await createGameContainer(
             appState,
@@ -489,6 +593,17 @@ export function configureServersRouter(appState: AppState): Router {
             'UPDATE servers SET docker_id = ?, state = ? WHERE id = ?',
             [dockerId, ServerState.Installed, serverId]
           );
+
+          appState.wsServer.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({
+                event: 'console_output',
+                data: { 
+                  message: `${chalk.yellow('[Krypton Daemon]')} Server installation completed successfully!`
+                }
+              }));
+            }
+          });
         })
         .catch(async (error) => {
           console.error('Installation failed:', error);
@@ -599,7 +714,7 @@ export function configureServersRouter(appState: AppState): Router {
       const serverConfig = await fetchServerConfig(appState.config.appUrl, id);
 
       const server = await appState.db.get(
-        'SELECT docker_id FROM servers WHERE id = ?',
+        'SELECT docker_id, memory_limit FROM servers WHERE id = ?',
         [id]
       );
 
@@ -626,7 +741,7 @@ export function configureServersRouter(appState: AppState): Router {
 
       // Run installation process
       logEvent(id, 'Starting reinstallation process');
-      await runInstallation(appState, id, serverConfig);
+      await runInstallation(appState, id, serverConfig, server.memory_limit);
       logEvent(id, 'Reinstallation completed');
 
       await appState.db.run(

@@ -497,7 +497,7 @@ export class WebSocketManager {
 
   private configureWebSocketRouter() {
     // Add rate limiting
-    const rateLimiter = RateLimit(60000, 100); // 100 messages per minute
+    const rateLimiter = RateLimit(60000, 1000); // 100 messages per minute
 
     this.appState.wsServer.on('connection', async (socket: WebSocket, request: any) => {
       // Apply rate limiting to the socket
