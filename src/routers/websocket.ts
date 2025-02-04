@@ -109,15 +109,7 @@ export class WebSocketManager {
   }
 
   private startHeartbeatCheck() {
-    setInterval(() => {
-      const now = Date.now();
-      for (const [socket, session] of this.sessions.entries()) {
-        if (now - session.lastHeartbeat > this.HEARTBEAT_INTERVAL * 2) {
-          console.log('[WebSocket] Closing stale connection');
-          socket.close(1008, 'Connection timed out');
-        }
-      }
-    }, this.HEARTBEAT_INTERVAL);
+    // Removed
   }
 
   private validatePayloadSize(data: string): boolean {
