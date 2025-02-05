@@ -1,16 +1,30 @@
+// Daemon: src/routers/servers.ts 
+
 import express, { Router } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
 import { Writable } from 'stream';
-import * as fs from 'fs/promises';
+import * as fs_p from 'fs/promises';
+import fs from 'fs';
 import * as path from 'path';
 import { AppState, ServerState } from '../index';
 import { Exec, ExecCreateOptions } from 'dockerode';
 import { Duplex } from 'stream';
 import chalk from 'chalk';
 
-// Types that represent what we expect from the panel
+interface CargoFile {
+  id: string;
+  url: string;
+  targetPath: string;
+  properties: {
+    hidden?: boolean;
+    readonly?: boolean;
+    noDelete?: boolean;
+    customProperties?: Record<string, any>;
+  };
+}
+
 interface ServerConfig {
   dockerImage: string;
   variables: Array<{
@@ -30,6 +44,7 @@ interface ServerConfig {
     entrypoint: string;
     script: string;
   };
+  cargo?: CargoFile[]; // Cargo!
 }
 
 interface CreateServerRequest {
@@ -87,10 +102,10 @@ async function writeConfigFiles(volumePath: string, configFiles: ServerConfig['c
     const safePath = path.normalize(file.path).replace(/^(\.\.[\/\\])+/, '');
     const fullPath = path.join(volumePath, safePath);
     
-    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs_p.mkdir(path.dirname(fullPath), { recursive: true });
     
     try {
-      await fs.writeFile(fullPath, file.content, 'utf8');
+      await fs_p.writeFile(fullPath, file.content, 'utf8');
       console.log(`Created config file: ${safePath}`);
     } catch (error) {
       console.error(`Failed to write config file ${safePath}:`, error);
@@ -99,9 +114,62 @@ async function writeConfigFiles(volumePath: string, configFiles: ServerConfig['c
   }
 }
 
-function processVariables(input: string, variables: ServerConfig['variables']): string {
+async function downloadCargoFile(url: string, targetPath: string): Promise<void> {
+  try {
+    const response = await axios({
+      method: 'GET',
+      url,
+      responseType: 'stream',
+      timeout: 30000
+    });
+
+    const writer = fs.createWriteStream(targetPath);
+    response.data.pipe(writer);
+
+    await new Promise((resolve, reject) => {
+      writer.on('finish', () => resolve(void 0));
+      writer.on('error', reject);
+    });
+  } catch (error) {
+    throw new Error(`Failed to download cargo file: ${error.message}`);
+  }
+}
+
+async function processCargoFiles(
+  volumePath: string, 
+  cargo: CargoFile[],
+  logger: InstallLogger
+): Promise<void> {
+  for (const file of cargo) {
+    const safePath = path.normalize(file.targetPath).replace(/^(\.\.[\/\\])+/, '');
+    const fullPath = path.join(volumePath, safePath);
+    
+    try {
+      // Create directory structure
+      await fs_p.mkdir(path.dirname(fullPath), { recursive: true });
+      
+      // Download the file
+      logger.log(`Downloading cargo file to ${safePath}...`);
+      await downloadCargoFile(file.url, fullPath);
+      
+      // Set file permissions based on properties
+      if (file.properties.readonly) {
+        await fs_p.chmod(fullPath, 0o444);
+      }
+      
+      logger.log(`Successfully processed cargo file: ${safePath}`);
+    } catch (error) {
+      logger.log(`Failed to process cargo file ${safePath}`, error);
+      throw error;
+    }
+  }
+}
+
+// Update the processVariables function to handle cargo syntax
+function processVariables(input: string, variables: ServerConfig['variables'], cargo?: CargoFile[]): string {
   let result = input;
   
+  // Process standard variables first
   for (const variable of variables) {
     const placeholder = `%${variable.name.toLowerCase().replace(/ /g, '_')}%`;
     const value = variable.currentValue ?? variable.defaultValue;
@@ -111,6 +179,18 @@ function processVariables(input: string, variables: ServerConfig['variables']): 
     }
     
     result = result.replace(placeholder, value);
+  }
+  
+  // Process cargo variables if they exist
+  if (cargo) {
+    const cargoRegex = /%cargo:\['([^']+)'\]%/g;
+    result = result.replace(cargoRegex, (match, path) => {
+      const cargoFile = cargo.find(c => c.targetPath === path);
+      if (!cargoFile) {
+        throw new Error(`Referenced cargo file not found: ${path}`);
+      }
+      return path;
+    });
   }
   
   return result;
@@ -228,7 +308,7 @@ export async function runInstallation(
   
   // Create installation workspace
   const installationPath = path.join(volumePath, '.installation');
-  await fs.mkdir(installationPath, { recursive: true });
+  await fs_p.mkdir(installationPath, { recursive: true });
   
   try {
     // Prepare installation environment
@@ -261,13 +341,13 @@ export async function runInstallation(
     logger.log('Installation completed successfully');
     
     // Cleanup installation files
-    await fs.rm(installationPath, { recursive: true, force: true });
+    await fs_p.rm(installationPath, { recursive: true, force: true });
     
   } catch (error) {
     logger.log('Installation failed', error);
     // Save installation logs
     const logPath = path.join(volumePath, 'installation.log');
-    await fs.writeFile(logPath, logger.getLogBuffer().join('\n'));
+    await fs_p.writeFile(logPath, logger.getLogBuffer().join('\n'));
     throw error;
   }
 }
@@ -278,17 +358,23 @@ async function prepareInstallationEnvironment(
   logger: InstallLogger
 ): Promise<void> {
   // Create necessary directories
-  await fs.mkdir(path.join(installPath, 'logs'), { recursive: true });
-  await fs.mkdir(path.join(installPath, 'temp'), { recursive: true });
+  await fs_p.mkdir(path.join(installPath, 'logs'), { recursive: true });
+  await fs_p.mkdir(path.join(installPath, 'temp'), { recursive: true });
   
   // Write configuration files
   for (const file of config.configFiles) {
     const safePath = path.normalize(file.path).replace(/^(\.\.[\/\\])+/, '');
     const fullPath = path.join(installPath, 'config', safePath);
     
-    await fs.mkdir(path.dirname(fullPath), { recursive: true });
-    await fs.writeFile(fullPath, file.content, 'utf8');
+    await fs_p.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs_p.writeFile(fullPath, file.content, 'utf8');
     logger.log(`Created config file: ${safePath}`);
+  }
+
+  // Process cargo files if they exist
+  if (config.cargo && config.cargo.length > 0) {
+    logger.log('Processing cargo files...');
+    await processCargoFiles(installPath, config.cargo, logger);
   }
 }
 
@@ -352,8 +438,8 @@ echo "=== Installation Finished at $(date) with exit code $EXIT_CODE ==="
 exit $EXIT_CODE`;
 
   const scriptPath = path.join(installPath, 'install.sh');
-  await fs.writeFile(scriptPath, scriptContent, { mode: 0o755 });
-  await fs.chmod(scriptPath, 0o755);  // Ensure script is executable
+  await fs_p.writeFile(scriptPath, scriptContent, { mode: 0o755 });
+  await fs_p.chmod(scriptPath, 0o755);  // Ensure script is executable
   
   return scriptPath;
 }
@@ -693,7 +779,7 @@ export function configureServersRouter(appState: AppState): Router {
 
       // Remove volume directory
       const volumePath = `${appState.config.volumesDirectory}/${safeId}`;
-      await fs.rm(volumePath, { recursive: true, force: true });
+      await fs_p.rm(volumePath, { recursive: true, force: true });
       logEvent(id, 'Removed volume directory');
 
       // Remove from database
@@ -703,6 +789,37 @@ export function configureServersRouter(appState: AppState): Router {
       res.json({ message: 'Server deleted successfully' });
     } catch (error) {
       console.error('Failed to delete server:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  router.post('/:id/cargo/ship', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const cargo = req.body.cargo as CargoFile[];
+  
+      if (!Array.isArray(cargo)) {
+        return res.status(400).json({ error: 'Invalid cargo format' });
+      }
+  
+      const server = await appState.db.get(
+        'SELECT id FROM servers WHERE id = ?',
+        [id]
+      );
+  
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+  
+      const volumePath = path.join(appState.config.volumesDirectory, sanitizeVolumeName(id));
+      const logger = new InstallLogger(id, appState.wsServer);
+  
+      // Process the cargo files
+      await processCargoFiles(volumePath, cargo, logger);
+  
+      res.json({ message: 'Cargo shipped successfully' });
+    } catch (error) {
+      console.error('Failed to ship cargo:', error);
       res.status(500).json({ error: error.message });
     }
   });
