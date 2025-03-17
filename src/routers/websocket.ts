@@ -133,8 +133,9 @@ export class WebSocketManager {
     }
 
     try {
+      console.log(token)
       const response = await axios.get(
-        `${this.appState.config.appUrl}/api/servers/${internalId}/validate`,
+        `${this.appState.config.appUrl}/api/servers/${internalId}/validate/${token}`,
         {
           headers: { 'Authorization': `Bearer ${token}` },
           timeout: 5000 // 5 second timeout
@@ -146,6 +147,8 @@ export class WebSocketManager {
         validation,
         timestamp: Date.now()
       });
+
+      console.log('[Token Validation] Validation successful:', validation);
 
       return validation;
     } catch (error) {
@@ -488,12 +491,7 @@ export class WebSocketManager {
   }
 
   private configureWebSocketRouter() {
-    // Add rate limiting
-    const rateLimiter = RateLimit(60000, 1000); // 100 messages per minute
-
     this.appState.wsServer.on('connection', async (socket: WebSocket, request: any) => {
-      // Apply rate limiting to the socket
-      rateLimiter(socket);
       const ip = request.socket.remoteAddress;
       
       // Check connection limit per IP
@@ -523,7 +521,7 @@ export class WebSocketManager {
       }
   
       const validation = await this.validateToken(internalId, token);
-      if (!validation?.validated) {
+      if (!validation?.validated == true) {
         console.log('[WebSocket] Token validation failed');
         socket.close(1008, 'Invalid token or access denied');
         clearTimeout(connectionTimeout);

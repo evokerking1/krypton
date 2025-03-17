@@ -61,10 +61,10 @@ export function configureFilesystemRouter(appState: AppState): Router {
   async function validateToken(serverId: string, token: string): Promise<ValidationResponse | null> {
     try {
       const response = await axios.get(
-        `${appState.config.appUrl}/api/servers/${serverId}/validate`,
+        `${appState.config.appUrl}/api/servers/${serverId}/validate/${token}`,
         {
           headers: { 'Authorization': `Bearer ${token}` },
-          timeout: 5000
+          timeout: 5000 // 5 second timeout
         }
       );
       return response.data;
