@@ -86,8 +86,7 @@ async function fetchServerConfig(appUrl: string, serverId: string): Promise<Serv
 async function validateServerWithPanel(appUrl: string, serverId: string, validationToken: string): Promise<boolean> {
   try {
     const response = await axios.post(
-      `${appUrl}/api/servers/validate/${serverId}`,
-      { validationToken },
+      `${appUrl}/api/servers/${serverId}/validate/${validationToken}`,
       { timeout: 5000 }
     );
     return response.status === 200;

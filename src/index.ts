@@ -149,10 +149,16 @@ async function initDb(db: Database): Promise<void> {
   `);
 }
 
-// API key middleware
 function apiKeyMiddleware(config: Config) {
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const apiKey = req.header('X-API-Key');
+    
+    console.log('API Key middleware:', {
+      path: req.path,
+      receivedKey: apiKey ? `${apiKey.substring(0, 3)}...` : 'none',
+      expectedKey: `${config.apiKey.substring(0, 3)}...`,
+      headers: Object.keys(req.headers)
+    });
     
     if (!apiKey || apiKey !== config.apiKey) {
       return res.status(401).json({ error: 'Invalid API key' });

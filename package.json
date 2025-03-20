@@ -1,6 +1,8 @@
 {
   "scripts": {
     "start": "bun run src/index.ts",
+    "dev": "bun run src/index.ts --watch",
+    "build": "bun build ./src/index.ts --compile --outfile krypton",
     "configure": "bun run cli/configure.ts"
   },
   "dependencies": {
