@@ -624,12 +624,6 @@ export function configureServersRouter(appState: AppState): Router {
     try {
       const { serverId, validationToken, name, memoryLimit, cpuLimit, allocation } = req.body as CreateServerRequest;
       
-      // Validate with panel first
-      const isValid = await validateServerWithPanel(appState.config.appUrl, serverId, validationToken);
-      if (!isValid) {
-        return res.status(403).json({ error: 'Invalid server registration' });
-      }
-      
       // Get server configuration from panel
       const serverConfig = await fetchServerConfig(appState.config.appUrl, serverId);
       

@@ -1,3 +1,8 @@
+/*
+ * Krypton Daemon version v1.0.0-dev (Barbarian)
+ * (c) 2017 - 2025 ether
+ */
+
 import express from 'express';
 import { Server as HttpServer } from 'http';
 import Docker from 'dockerode';

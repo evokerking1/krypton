@@ -495,12 +495,12 @@ export class WebSocketManager {
       const ip = request.socket.remoteAddress;
       
       // Check connection limit per IP
-      const currentConnections = this.ipConnections.get(ip) || 0;
-      if (currentConnections >= this.MAX_CONNECTIONS_PER_IP) {
-        socket.close(1008, 'Too many connections from this IP');
-        return;
-      }
-      this.ipConnections.set(ip, currentConnections + 1);
+      //const currentConnections = this.ipConnections.get(ip) || 0;
+      //if (currentConnections >= this.MAX_CONNECTIONS_PER_IP) {
+      //  socket.close(1008, 'Too many connections from this IP');
+      //  return;
+      //}
+      //this.ipConnections.set(ip, currentConnections + 1);
 
       // Set connection timeout
       const connectionTimeout = setTimeout(() => {
