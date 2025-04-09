@@ -55,6 +55,8 @@ export enum ServerState {
   Installed = 'installed',    // Successfully installed
   Starting = 'starting',
   Running = 'running',
+  Updating = 'updating',      // Updating server (modification)
+  UpdateFailed = 'update_failed', // Update failed
   Stopping = 'stopping',
   Stopped = 'stopped',
   Errored = 'errored',

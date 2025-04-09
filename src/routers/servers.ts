@@ -59,6 +59,19 @@ interface CreateServerRequest {
   };
 }
 
+interface UpdateServerRequest {
+  serverId: string;
+  name: string;
+  memoryLimit: number;
+  cpuLimit: number;
+  allocation: {
+    bindAddress: string;
+    port: number;
+  };
+  unitChanged?: boolean;
+  dockerImage?: string;
+}
+
 // Helper functions for server management
 async function fetchServerConfig(appUrl: string, serverId: string): Promise<ServerConfig> {
   const url = `${appUrl}/api/servers/${serverId}/config`;
@@ -615,7 +628,148 @@ async function createGameContainer(
   return container.id;
 }
 
-// Configure the router
+async function recreateGameContainer(
+  appState: AppState,
+  serverId: string,
+  updateData: UpdateServerRequest,
+  currentDockerId?: string
+): Promise<string> {
+  const { docker } = appState;
+  const safeServerId = sanitizeVolumeName(serverId);
+  const volumePath = path.resolve(`${appState.config.volumesDirectory}/${safeServerId}`);
+  
+  // Fetch the latest server config if unit changed
+  let serverConfig: ServerConfig;
+  if (updateData.unitChanged) {
+    serverConfig = await fetchServerConfig(appState.config.appUrl, serverId);
+  } else {
+    // Get current configuration from the database
+    const dbServer = await appState.db.get('SELECT * FROM servers WHERE id = ?', [serverId]);
+    serverConfig = {
+      dockerImage: updateData.dockerImage || dbServer.image,
+      variables: JSON.parse(dbServer.variables),
+      startupCommand: dbServer.startup_command,
+      configFiles: [], // We don't need these for recreation
+      install: JSON.parse(dbServer.install_script)
+    };
+  }
+  
+  // Process the startup command with variables
+  const processedStartupCommand = processVariables(serverConfig.startupCommand, serverConfig.variables);
+  
+  // Pull new image if unit/image changed
+  if (updateData.unitChanged && updateData.dockerImage) {
+    try {
+      await pullDockerImage(docker, updateData.dockerImage);
+    } catch (error) {
+      console.error(`Failed to pull new Docker image: ${error.message}`);
+      throw new Error(`Failed to pull new Docker image: ${error.message}`);
+    }
+  }
+  
+  // Stop and remove existing container if it exists
+  if (currentDockerId) {
+    try {
+      const container = docker.getContainer(currentDockerId);
+      const containerInfo = await container.inspect();
+      
+      // Only stop if running
+      if (containerInfo.State.Running) {
+        await container.stop({ t: 10 }); // 10 second timeout
+      }
+      
+      // Remove the container but keep volumes
+      await container.remove();
+      logEvent(serverId, 'Removed old container for update');
+    } catch (error) {
+      console.error('Failed to remove existing container:', error);
+      logEvent(serverId, 'Failed to remove old container for update', error);
+      // Continue with recreation even if removal fails
+    }
+  }
+  
+  // Prepare environment variables
+  const environmentVariables = [
+    'TERM=xterm',
+    'HOME=/home/container',
+    'USER=container',
+    `STARTUP=${processedStartupCommand}`,
+    ...serverConfig.variables.map(variable => 
+      `${variable.name}=${variable.currentValue || variable.defaultValue}`
+    )
+  ];
+
+  // Create new container with updated settings
+  const container = await docker.createContainer({
+    name: safeServerId,
+    Image: serverConfig.dockerImage,
+    
+    Entrypoint: undefined,
+    Cmd: undefined,
+    
+    WorkingDir: '/home/container',
+    AttachStdin: true,
+    AttachStdout: true,
+    AttachStderr: true,
+    OpenStdin: true,
+    Tty: false,
+    StdinOnce: false,
+    User: 'container',
+    
+    Env: environmentVariables,
+    
+    HostConfig: {
+      Memory: updateData.memoryLimit,
+      MemorySwap: updateData.memoryLimit * 2,
+      
+      CpuQuota: updateData.cpuLimit ? updateData.cpuLimit * 100000 : 0,
+      CpuPeriod: 100000,
+      
+      NetworkMode: 'bridge',
+      
+      Init: true,
+      SecurityOpt: ['no-new-privileges'],
+      ReadonlyPaths: [
+        '/proc/bus',
+        '/proc/fs',
+        '/proc/irq',
+        '/proc/sys',
+        '/proc/sysrq-trigger'
+      ],
+      
+      RestartPolicy: {
+        Name: 'unless-stopped'
+      },
+      
+      Binds: [`${volumePath}:/home/container:rw`],
+      
+      PortBindings: {
+        [`${updateData.allocation.port}/tcp`]: [{
+          HostIp: updateData.allocation.bindAddress,
+          HostPort: updateData.allocation.port.toString()
+        }],
+        [`${updateData.allocation.port}/udp`]: [{
+          HostIp: updateData.allocation.bindAddress,
+          HostPort: updateData.allocation.port.toString()
+        }]
+      },
+    },
+    
+    ExposedPorts: {
+      [`${updateData.allocation.port}/tcp`]: {},
+      [`${updateData.allocation.port}/udp`]: {}
+    },
+
+    Labels: {
+      'pterodactyl.server.id': serverId,
+      'pterodactyl.server.name': safeServerId
+    }
+  });
+
+  return container.id;
+}
+
+// Router
 export function configureServersRouter(appState: AppState): Router {
   const router = Router();
 
@@ -693,6 +847,82 @@ export function configureServersRouter(appState: AppState): Router {
         });
     } catch (error) {
       console.error('Failed to create server:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  router.patch('/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const updateData = req.body as UpdateServerRequest;
+      
+      // Validate request data
+      if (!updateData.serverId || updateData.serverId !== id) {
+        return res.status(400).json({ error: 'Invalid server ID in request data' });
+      }
+      
+      // Get the current server data
+      const server = await appState.db.get(
+        'SELECT docker_id, image FROM servers WHERE id = ?',
+        [id]
+      );
+      
+      if (!server) {
+        return res.status(404).json({ error: 'Server not found' });
+      }
+      
+      // Update server state to indicate it's being modified
+      await appState.db.run(
+        'UPDATE servers SET state = ? WHERE id = ?',
+        [ServerState.Updating, id]
+      );
+      
+      // Recreate the container with updated settings
+      const newDockerId = await recreateGameContainer(
+        appState,
+        id,
+        updateData,
+        server.docker_id
+      );
+      
+      // Start the new container
+      const container = appState.docker.getContainer(newDockerId);
+      await container.start();
+      
+      // Update the database with new container ID and image
+      await appState.db.run(
+        'UPDATE servers SET docker_id = ?, state = ?, name = ?, memory_limit = ?, cpu_limit = ?, image = ? WHERE id = ?',
+        [
+          newDockerId,
+          ServerState.Running,
+          updateData.name,
+          updateData.memoryLimit,
+          updateData.cpuLimit,
+          updateData.unitChanged && updateData.dockerImage ? updateData.dockerImage : server.image,
+          id
+        ]
+      );
+      
+      // Get updated server info
+      const updatedServer = await appState.db.get(
+        'SELECT * FROM servers WHERE id = ?',
+        [id]
+      );
+      
+      res.json({
+        message: 'Server updated successfully',
+        server: updatedServer
+      });
+      
+    } catch (error) {
+      console.error('Failed to update server:', error);
+      
+      // Update state to indicate failure
+      await appState.db.run(
+        'UPDATE servers SET state = ? WHERE id = ?',
+        [ServerState.UpdateFailed, req.params.id]
+      );
+      
       res.status(500).json({ error: error.message });
     }
   });
