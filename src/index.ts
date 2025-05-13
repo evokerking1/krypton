@@ -1,5 +1,5 @@
 /*
- * Krypton Daemon version v1.0.0-dev (Barbarian)
+ * Krypton Daemon
  * (c) 2017 - 2025 ether
  */
 
@@ -156,6 +156,19 @@ async function initDb(db: Database): Promise<void> {
   `);
 }
 
+// Check if Docker daemon is available
+async function checkDockerAvailability(docker: Docker): Promise<boolean> {
+  try {
+    // Attempt to ping the Docker daemon
+    await docker.ping();
+    console.log('Completed preflight checks.');
+    return true;
+  } catch (error) {
+    console.error('Hmm... We couldn\'t connect to Docker. Socket error:', error.message);
+    return false;
+  }
+}
+
 function apiKeyMiddleware(config: Config) {
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const apiKey = req.header('X-API-Key');
@@ -186,6 +199,13 @@ async function main() {
 
     // Initialize Docker client
     const docker = new Docker();
+    
+    // Check if Docker daemon is running
+    const isDockerRunning = await checkDockerAvailability(docker);
+    if (!isDockerRunning) {
+      console.error('Krypton requires Docker to be running. Please start Docker and try again.');
+      process.exit(1);
+    }
 
     // Initialize SQLite database
     const db = await open({
@@ -238,7 +258,7 @@ async function main() {
 
     // Start server
     server.listen(config.bindPort, config.bindAddress, () => {
-      console.log(`Krypton is now running on ${config.bindAddress}:${config.bindPort}`);
+      console.log(`Krypton Daemon (version 0.8.0) is up on port ${config.bindPort}!`);
       wsServer.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({
