@@ -15,6 +15,7 @@ import si from 'systeminformation';
 import yaml from 'js-yaml';
 import cors from 'cors';
 import expressWs from 'express-ws'
+import chalk from 'chalk';
 
 // Routers
 import { configureServersRouter, runInstallation } from './routers/servers';
@@ -22,7 +23,7 @@ import { configureStateRouter } from './routers/state';
 import { configureWebSocketRouter } from './routers/websocket';
 import { configureFilesystemRouter } from './routers/filesystem';
 
-export const VERSION = '1.0.0';
+export const VERSION = '0.8.0';
 
 // Types
 export interface Config {
@@ -161,7 +162,7 @@ async function checkDockerAvailability(docker: Docker): Promise<boolean> {
   try {
     // Attempt to ping the Docker daemon
     await docker.ping();
-    console.log('Completed preflight checks.');
+    console.log(chalk.green('docker daemon') + chalk.white(' connected'));
     return true;
   } catch (error) {
     console.error('Hmm... We couldn\'t connect to Docker. Socket error:', error.message);
@@ -258,7 +259,7 @@ async function main() {
 
     // Start server
     server.listen(config.bindPort, config.bindAddress, () => {
-      console.log(`Krypton Daemon (version 0.8.0) is up on port ${config.bindPort}!`);
+      console.log(chalk.red('https server') + chalk.white(' listening on') + chalk.cyan(` ${config.bindAddress}:${config.bindPort}`) + chalk.gray(' (krypton@' + VERSION + ')'));
       wsServer.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({
