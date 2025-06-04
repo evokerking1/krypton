@@ -93,14 +93,21 @@ export function configureFilesystemRouter(appState: AppState): Router {
 
   // Auth middleware
   async function authMiddleware(req: AuthenticatedRequest, res: express.Response, next: express.NextFunction) {
+    // Check for token in Authorization header or ?token= query
+    let token: string | undefined;
     const authHeader = req.header('Authorization');
-    const serverId = req.params.serverId;
-
-    if (!authHeader?.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Missing or invalid authorization header' });
+    if (authHeader?.startsWith('Bearer ')) {
+      token = authHeader.substring(7);
+    } else if (typeof req.query.token === 'string') {
+      token = req.query.token;
     }
 
-    const token = authHeader.substring(7);
+    const serverId = req.params.serverId;
+
+    if (!token) {
+      return res.status(401).json({ error: 'Missing or invalid authorization token' });
+    }
+
     const validation = await validateToken(serverId, token);
 
     if (!validation?.validated) {

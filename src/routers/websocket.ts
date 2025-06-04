@@ -216,79 +216,127 @@ export class WebSocketManager {
     }
   }
 
-  private async attachLogs(session: ConsoleSession) {
-    try {
-      if (session.logStream) {
-        session.logStream.destroy();
-      }
-  
-      session.logStream = await session.container.logs({
-        follow: true,
-        stdout: true,
-        stderr: true,
-        tail: 0
-      });
-  
-      let buffer = '';
-      const decoder = new TextDecoder('utf-8');
-      let lastLogTime = Date.now();
-      let logCount = 0;
-  
-      session.logStream.on('data', (chunk: Buffer) => {
-        try {
-          // Rate limiting for logs
-          const now = Date.now();
-          if (now - lastLogTime < 100) { // Max 10 logs per second
-            logCount++;
-            if (logCount > 10) {
-              return;
-            }
-          } else {
-            lastLogTime = now;
-            logCount = 0;
+private async attachLogs(session: ConsoleSession) {
+  try {
+    if (session.logStream) {
+      session.logStream.destroy();
+    }
+
+    session.logStream = await session.container.logs({
+      follow: true,
+      stdout: true,
+      stderr: true,
+      tail: 0
+    });
+
+    let buffer = '';
+    let lastLogTime = Date.now();
+    let logCount = 0;
+
+    // SINGLE event handler - remove the duplicate one from your code
+    session.logStream.on('data', (chunk: Buffer) => {
+      try {
+        // Rate limiting for logs
+        const now = Date.now();
+        if (now - lastLogTime < 100) {
+          logCount++;
+          if (logCount > 10) {
+            return;
+          }
+        } else {
+          lastLogTime = now;
+          logCount = 0;
+        }
+
+        // More robust Docker log parsing
+        let offset = 0;
+        
+        while (offset < chunk.length) {
+          // Docker multiplexed stream format:
+          // [0]: stream type (0=stdin, 1=stdout, 2=stderr)
+          // [1-3]: padding (should be 0)
+          // [4-7]: size (big-endian uint32)
+          // [8+]: actual log data
+          
+          if (offset + 8 > chunk.length) {
+            // Not enough bytes for a complete header, treat as raw data
+            const remaining = chunk.slice(offset).toString('utf8');
+            buffer += remaining;
+            break;
           }
 
-          const header = chunk.slice(0, 8);
-          const content = chunk.slice(8);
-          
-          const data = decoder.decode(content);
-          
-          buffer += data;
-          
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() || '';
-  
-          for (const line of lines) {
-            if (line.trim()) {
-              // Sanitize and clean the log line
-              const cleaned = line
-                .replace('pterodactyl', 'argon')
-  
-              if (cleaned && this.validatePayloadSize(cleaned)) {
-                this.addLogToBuffer(session.internalId, cleaned);
-  
-                session.socket.send(JSON.stringify({
-                  event: 'console_output',
-                  data: { message: cleaned }
-                }));
-              }
+          const streamType = chunk[offset];
+          const padding1 = chunk[offset + 1];
+          const padding2 = chunk[offset + 2]; 
+          const padding3 = chunk[offset + 3];
+          const size = chunk.readUInt32BE(offset + 4);
+
+          // Validate the header structure
+          const isValidHeader = (
+            streamType <= 2 && 
+            padding1 === 0 && 
+            padding2 === 0 && 
+            padding3 === 0 &&
+            size > 0 && 
+            size <= chunk.length - 8 &&
+            offset + 8 + size <= chunk.length
+          );
+
+          if (isValidHeader) {
+            // Valid Docker header - extract the message
+            const messageStart = offset + 8;
+            const messageEnd = messageStart + size;
+            const messageBytes = chunk.slice(messageStart, messageEnd);
+            const message = messageBytes.toString('utf8');
+            
+            buffer += message;
+            offset = messageEnd;
+          } else {
+            // Invalid header or corrupted data - treat as plain text
+            // This handles cases where Docker isn't using multiplexed streams
+            const remaining = chunk.slice(offset).toString('utf8');
+            buffer += remaining;
+            break;
+          }
+        }
+        
+        // Process complete lines from buffer
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.length > 0) {
+            // Clean the log line
+            const cleaned = trimmed
+              .replace('pterodactyl', 'argon')
+              .trim();
+
+            if (cleaned && this.validatePayloadSize(cleaned)) {
+              this.addLogToBuffer(session.internalId, cleaned);
+
+              session.socket.send(JSON.stringify({
+                event: 'console_output',
+                data: { message: cleaned }
+              }));
             }
           }
-        } catch (error) {
-          console.error('[Logs] Error processing output:', error);
         }
-      });
-  
-      session.logStream.on('error', (error) => {
-        console.error('[Logs] Stream error:', error);
-        setTimeout(() => this.attachLogs(session), 5000);
-      });
-  
-    } catch (error) {
-      console.error('[Logs] Setup error:', error);
+      } catch (error) {
+        console.error('[Logs] Error processing output:', error);
+      }
+    });
+
+    session.logStream.on('error', (error) => {
+      console.error('[Logs] Stream error:', error);
       setTimeout(() => this.attachLogs(session), 5000);
-    }
+    });
+
+  } catch (error) {
+    console.error('[Logs] Setup error:', error);
+    setTimeout(() => this.attachLogs(session), 5000);
   }
+}
 
   private async startResourceMonitoring(session: ConsoleSession) {
     let lastNetworkRx = 0;
@@ -420,75 +468,91 @@ export class WebSocketManager {
   }
 
   private async handlePowerAction(session: ConsoleSession, action: string) {
-    if (!['start', 'stop', 'restart'].includes(action)) {
-      throw new Error('Invalid power action');
-    }
-
-    try {
-      this.broadcastToServer(session.internalId, `Performing a ${action} action on server...`, LogType.DAEMON);
-
-      const containerInfo = await session.container.inspect();
-      const currentState = containerInfo.State.Status.replace('exited', 'stopped');
-
-      // Validate state transitions
-      if (
-        (action === 'start' && currentState === 'running') ||
-        (action === 'stop' && currentState === 'stopped') ||
-        (action === 'restart' && currentState === 'restarting')
-      ) {
-        throw new Error(`Server is already in ${currentState} state`);
-      }
-
-      switch (action) {
-        case 'start':
-          await session.container.start();
-          await this.attachLogs(session);
-          break;
-
-        case 'stop':
-          await session.container.stop({
-            t: 30 // Give 30 seconds for graceful shutdown
-          });
-          break;
-
-        case 'restart':
-          await session.container.restart({
-            t: 30 // Give 30 seconds for graceful shutdown
-          });
-          await this.attachLogs(session);
-          break;
-      }
-
-      // Clear log buffers on power state changes
-      this.logBuffers.delete(session.internalId);
-
-      const newContainerInfo = await session.container.inspect();
-      const state = newContainerInfo.State.Status;
-      const error = newContainerInfo.State.Error || '';
-
-      session.socket.send(JSON.stringify({
-        event: 'power_status',
-        data: {
-          status: state === 'running' ? 
-            `${chalk.yellow('[Krypton Daemon]')} The server is now powered on and will begin the pre-boot process.` : 
-            `${chalk.yellow('[Krypton Daemon]')} The server has successfully been powered off.`,
-          action,
-          state: state.replace('exited', 'stopped'),
-          error
-        }
-      }));
-
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      this.broadcastToServer(session.internalId, `Failed to ${action} server: ${errorMsg}`, LogType.ERROR);
-      console.error(`Server ${action} failed:`, error);
-      
-      session.socket.send(JSON.stringify({
-        event: 'error',
-        data: { message: errorMsg }
-      }));
-    }
+  // Updated to include 'kill' action
+  if (!['start', 'stop', 'restart', 'kill'].includes(action)) {
+    throw new Error('Invalid power action');
   }
+
+  try {
+    this.broadcastToServer(session.internalId, `Performing a ${action} action on server...`, LogType.DAEMON);
+
+    const containerInfo = await session.container.inspect();
+    const currentState = containerInfo.State.Status.replace('exited', 'stopped');
+
+    // Validate state transitions
+    if (
+      (action === 'start' && currentState === 'running') ||
+      ((action === 'stop' || action === 'kill') && currentState === 'stopped') ||
+      (action === 'restart' && currentState === 'restarting')
+    ) {
+      throw new Error(`Server is already in ${currentState} state`);
+    }
+
+    switch (action) {
+      case 'start':
+        await session.container.start();
+        await this.attachLogs(session);
+        break;
+
+      case 'stop':
+        await session.container.stop({
+          t: 30 // Give 30 seconds for graceful shutdown
+        });
+        break;
+
+      case 'kill':
+        // Force kill the container immediately without graceful shutdown
+        await session.container.kill();
+        break;
+
+      case 'restart':
+        await session.container.restart({
+          t: 30 // Give 30 seconds for graceful shutdown
+        });
+        await this.attachLogs(session);
+        break;
+    }
+
+    // Clear log buffers on power state changes
+    this.logBuffers.delete(session.internalId);
+
+    const newContainerInfo = await session.container.inspect();
+    const state = newContainerInfo.State.Status;
+    const error = newContainerInfo.State.Error || '';
+
+    // Updated status messages to handle kill action
+    let statusMessage: string;
+    if (state === 'running') {
+      statusMessage = `${chalk.yellow('[Krypton Daemon]')} The server is now powered on and will begin the pre-boot process.`;
+    } else {
+      if (action === 'kill') {
+        statusMessage = `${chalk.yellow('[Krypton Daemon]')} The server has been forcefully terminated.`;
+      } else {
+        statusMessage = `${chalk.yellow('[Krypton Daemon]')} The server has successfully been powered off.`;
+      }
+    }
+
+    session.socket.send(JSON.stringify({
+      event: 'power_status',
+      data: {
+        status: statusMessage,
+        action,
+        state: state.replace('exited', 'stopped'),
+        error
+      }
+    }));
+
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+    this.broadcastToServer(session.internalId, `Failed to ${action} server: ${errorMsg}`, LogType.ERROR);
+    console.error(`Server ${action} failed:`, error);
+    
+    session.socket.send(JSON.stringify({
+      event: 'error',
+      data: { message: errorMsg }
+    }));
+  }
+}
 
   private configureWebSocketRouter() {
     this.appState.wsServer.on('connection', async (socket: WebSocket, request: any) => {
