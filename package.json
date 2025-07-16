@@ -1,4 +1,7 @@
 {
+  "name": "krypton",
+  "author": "Webwise Technologies",
+  "version": "1.0.0",
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run src/index.ts --watch",
